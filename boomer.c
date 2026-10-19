@@ -36,8 +36,14 @@ typedef struct {
 static Dup dups[16];
 static int ndups, dup_lost, retry;
 // D3D device per GPU, kept across popups: creating one takes ~170ms, the rest ~10ms.
-static struct { LUID luid; ID3D11Device *dev; ID3D11DeviceContext *ctx; } devs[8];
+static struct { LUID luid; ID3D11Device *dev; ID3D11DeviceContext *ctx; int used; } devs[8];
 static int ndevs;
+
+static void drop_dev(int i) {
+    ID3D11DeviceContext_Release(devs[i].ctx);
+    ID3D11Device_Release(devs[i].dev);
+    devs[i] = devs[--ndevs];
+}
 
 static int get_device(IDXGIAdapter1 *a, ID3D11Device **dev, ID3D11DeviceContext **ctx) {
     DXGI_ADAPTER_DESC1 ad;
@@ -46,9 +52,7 @@ static int get_device(IDXGIAdapter1 *a, ID3D11Device **dev, ID3D11DeviceContext 
     for (i = 0; i < ndevs; i++)
         if (!memcmp(&devs[i].luid, &ad.AdapterLuid, sizeof(LUID))) break;
     if (i < ndevs && ID3D11Device_GetDeviceRemovedReason(devs[i].dev) != S_OK) { // driver reset
-        ID3D11DeviceContext_Release(devs[i].ctx);
-        ID3D11Device_Release(devs[i].dev);
-        devs[i] = devs[--ndevs];
+        drop_dev(i);
         i = ndevs;
     }
     if (i == ndevs) {
@@ -58,6 +62,7 @@ static int get_device(IDXGIAdapter1 *a, ID3D11Device **dev, ID3D11DeviceContext 
         devs[i].luid = ad.AdapterLuid;
         ndevs++;
     }
+    devs[i].used = 1;
     *dev = devs[i].dev;
     *ctx = devs[i].ctx;
     return 1;
@@ -116,6 +121,7 @@ static void open_dups(void) {
     close_dups();
     dup_lost = 0;
     if (FAILED(CreateDXGIFactory1(&IID_IDXGIFactory1, (void **)&f))) return;
+    for (int i = 0; i < ndevs; i++) devs[i].used = 0;
     for (UINT i = 0; IDXGIFactory1_EnumAdapters1(f, i, &a) != DXGI_ERROR_NOT_FOUND; i++) {
         ID3D11Device *dev = NULL;
         ID3D11DeviceContext *ctx;
@@ -148,6 +154,9 @@ static void open_dups(void) {
         IDXGIAdapter1_Release(a);
     }
     IDXGIFactory1_Release(f);
+    // GPU lost its monitors (unplugged): let it power down. Backwards, as drop_dev swaps in the last entry.
+    for (int i = ndevs; i-- > 0;)
+        if (!devs[i].used) drop_dev(i);
 }
 
 // Clamp a tw x th frame at (x0,y0) to a bw x bh buffer; returns 0 if nothing of it is inside.
@@ -427,7 +436,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prevInst, LPSTR cmd, int show) {
     w = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, L"boomer", L"boomer", WS_POPUP,
                         0, 0, 1, 1, NULL, NULL, inst, NULL);
     // Live capture must not see our own window; this also hides boomer from screen sharing.
-    if (live) SetWindowDisplayAffinity(w, WDA_EXCLUDEFROMCAPTURE);
+    // Before Windows 10 2004 that fails and we'd capture ourselves, so zoom a still screenshot instead.
+    if (live && !SetWindowDisplayAffinity(w, WDA_EXCLUDEFROMCAPTURE)) live = 0;
     if (daemon) {
         if (!RegisterHotKey(w, 1, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, 'Z')) {
             MessageBoxW(NULL, L"Win+Shift+Z is taken (boomer already running?)", L"boomer", MB_ICONERROR);
