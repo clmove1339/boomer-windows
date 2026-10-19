@@ -83,20 +83,17 @@ static void free_bufs(void) {
     sw = sh = 0;
 }
 
-// Follow the current monitor layout: resize buffers and window if it changed.
-// Returns 0 if the screen buffers could not be allocated.
+// Follow the current monitor layout: allocate buffers and size the window to it.
+// Buffers are always free here (hide frees them). Returns 0 if they could not be allocated.
 static int fit_screen(HWND w) {
-    int cw = GetSystemMetrics(SM_CXVIRTUALSCREEN), ch = GetSystemMetrics(SM_CYVIRTUALSCREEN);
     DWORD *back;
-    if (cw != sw || ch != sh) {
-        free_bufs();
-        sw = cw; sh = ch;
-        hdcImg = make_dib(sw, sh, &img);
-        hdcDim = make_dib(sw, sh, &dim);
-        hdcBack = make_dib(sw, sh, &back);
-        if (!img || !dim || !back) { free_bufs(); return 0; }
-        SetStretchBltMode(hdcBack, COLORONCOLOR); // nearest neighbour = pixelated
-    }
+    sw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    sh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    hdcImg = make_dib(sw, sh, &img);
+    hdcDim = make_dib(sw, sh, &dim);
+    hdcBack = make_dib(sw, sh, &back);
+    if (!img || !dim || !back) { free_bufs(); return 0; }
+    SetStretchBltMode(hdcBack, COLORONCOLOR); // nearest neighbour = pixelated
     sx = GetSystemMetrics(SM_XVIRTUALSCREEN);
     sy = GetSystemMetrics(SM_YVIRTUALSCREEN);
     SetWindowPos(w, HWND_TOPMOST, sx, sy, sw, sh, SWP_NOACTIVATE);
@@ -120,37 +117,46 @@ static void open_dups(void) {
     dup_lost = 0;
     if (FAILED(CreateDXGIFactory1(&IID_IDXGIFactory1, (void **)&f))) return;
     for (UINT i = 0; IDXGIFactory1_EnumAdapters1(f, i, &a) != DXGI_ERROR_NOT_FOUND; i++) {
-        ID3D11Device *dev;
+        ID3D11Device *dev = NULL;
         ID3D11DeviceContext *ctx;
         IDXGIOutput *o;
-        if (get_device(a, &dev, &ctx)) {
-            for (UINT j = 0; ndups < 16 && IDXGIAdapter1_EnumOutputs(a, j, &o) != DXGI_ERROR_NOT_FOUND; j++) {
-                DXGI_OUTPUT_DESC od;
-                IDXGIOutput1 *o1;
-                IDXGIOutput_GetDesc(o, &od);
-                // shortcut: rotated monitors are left to the GDI capture; rotate the frame if anyone needs it.
-                if (od.AttachedToDesktop && od.Rotation <= DXGI_MODE_ROTATION_IDENTITY &&
-                    SUCCEEDED(IDXGIOutput_QueryInterface(o, &IID_IDXGIOutput1, (void **)&o1))) {
-                    Dup *d = &dups[ndups];
-                    HRESULT hr = IDXGIOutput1_DuplicateOutput(o1, (IUnknown *)dev, &d->dup);
-                    if (hr == E_ACCESSDENIED) dup_lost = 1; // secure desktop (lock screen, UAC): retry later
-                    if (SUCCEEDED(hr)) {
-                        d->dev = dev; ID3D11Device_AddRef(dev);
-                        d->ctx = ctx; ID3D11DeviceContext_AddRef(ctx);
-                        d->stage = NULL;
-                        d->x = od.DesktopCoordinates.left;
-                        d->y = od.DesktopCoordinates.top;
-                        d->fresh = 1;
-                        ndups++;
-                    }
-                    IDXGIOutput1_Release(o1);
+        for (UINT j = 0; ndups < 16 && IDXGIAdapter1_EnumOutputs(a, j, &o) != DXGI_ERROR_NOT_FOUND; j++) {
+            DXGI_OUTPUT_DESC od;
+            IDXGIOutput1 *o1;
+            IDXGIOutput_GetDesc(o, &od);
+            // shortcut: rotated monitors are left to the GDI capture; rotate the frame if anyone needs it.
+            // Device only for GPUs with a monitor: one on a laptop's idle dGPU would keep it powered.
+            if (od.AttachedToDesktop && od.Rotation <= DXGI_MODE_ROTATION_IDENTITY &&
+                (dev || get_device(a, &dev, &ctx)) &&
+                SUCCEEDED(IDXGIOutput_QueryInterface(o, &IID_IDXGIOutput1, (void **)&o1))) {
+                Dup *d = &dups[ndups];
+                HRESULT hr = IDXGIOutput1_DuplicateOutput(o1, (IUnknown *)dev, &d->dup);
+                if (hr == E_ACCESSDENIED) dup_lost = 1; // secure desktop (lock screen, UAC): retry later
+                if (SUCCEEDED(hr)) {
+                    d->dev = dev; ID3D11Device_AddRef(dev);
+                    d->ctx = ctx; ID3D11DeviceContext_AddRef(ctx);
+                    d->stage = NULL;
+                    d->x = od.DesktopCoordinates.left;
+                    d->y = od.DesktopCoordinates.top;
+                    d->fresh = 1;
+                    ndups++;
                 }
-                IDXGIOutput_Release(o);
+                IDXGIOutput1_Release(o1);
             }
+            IDXGIOutput_Release(o);
         }
         IDXGIAdapter1_Release(a);
     }
     IDXGIFactory1_Release(f);
+}
+
+// Clamp a tw x th frame at (x0,y0) to a bw x bh buffer; returns 0 if nothing of it is inside.
+// The frame can be a different size than the desktop mid mode-switch, or lie outside
+// our buffer if a monitor was added while open (layout is re-read on next popup).
+static int clip(int x0, int y0, int tw, int th, int bw, int bh, int *w, int *h) {
+    *w = min(tw, bw - x0);
+    *h = min(th, bh - y0);
+    return x0 >= 0 && y0 >= 0 && *w > 0 && *h > 0;
 }
 
 // Returns 1 if any pixel changed: our own repaints also produce frames, so skip identical ones.
@@ -160,11 +166,7 @@ static int copy_frame(Dup *d, ID3D11Texture2D *tex) {
     D3D11_MAPPED_SUBRESOURCE map;
     int x0 = d->x - sx, y0 = d->y - sy, w, h;
     ID3D11Texture2D_GetDesc(tex, &td);
-    // Clamp: the frame can be a different size than the desktop mid mode-switch, or lie
-    // outside our buffer if a monitor was added while open (layout is re-read on next popup).
-    w = min((int)td.Width, sw - x0);
-    h = min((int)td.Height, sh - y0);
-    if (td.Format != DXGI_FORMAT_B8G8R8A8_UNORM || x0 < 0 || y0 < 0 || w <= 0 || h <= 0) return 0;
+    if (td.Format != DXGI_FORMAT_B8G8R8A8_UNORM || !clip(x0, y0, td.Width, td.Height, sw, sh, &w, &h)) return 0;
     if (!d->stage) {
         td.Usage = D3D11_USAGE_STAGING;
         td.BindFlags = 0;
@@ -196,7 +198,9 @@ static int grab(UINT timeout) {
         DXGI_OUTDUPL_FRAME_INFO fi;
         IDXGIResource *res;
         ID3D11Texture2D *tex;
-        HRESULT hr = IDXGIOutputDuplication_AcquireNextFrame(d->dup, timeout, &fi, &res);
+        HRESULT hr;
+        if (timeout && !d->fresh) continue; // popup wait: this monitor is already captured
+        hr = IDXGIOutputDuplication_AcquireNextFrame(d->dup, timeout, &fi, &res);
         if (hr == DXGI_ERROR_WAIT_TIMEOUT) continue;
         if (FAILED(hr)) { dup_lost = 1; continue; } // mode switch, UAC, lock screen...
         // 0 = no new image (cursor-only update, or the black first frame of a new duplication)
@@ -400,6 +404,9 @@ static void self_test(void) {
     assert(view_rect(100, 100, 10.5, 2, &s, &sw_, &d, &dw) && s == 10 && sw_ == 51 && d == -1 && dw == 102);
     assert(view_rect(100, 100, -50, 1, &s, &sw_, &d, &dw) && s == 0 && sw_ == 50 && d == 50);
     assert(!view_rect(100, 100, 200, 1, &s, &sw_, &d, &dw));
+    assert(clip(60, 10, 50, 50, 100, 100, &s, &d) && s == 40 && d == 50); // sticks out right
+    assert(!clip(100, 0, 50, 50, 100, 100, &s, &d));                       // fully outside
+    assert(!clip(-10, 0, 50, 50, 100, 100, &s, &d));                       // left of buffer
 }
 
 int WINAPI WinMain(HINSTANCE inst, HINSTANCE prevInst, LPSTR cmd, int show) {
