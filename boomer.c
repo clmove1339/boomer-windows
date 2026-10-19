@@ -8,6 +8,7 @@
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
+#include <dwmapi.h>
 #include <math.h>
 #include <string.h>
 #include <assert.h>
@@ -18,7 +19,7 @@ static DWORD *img, *dim;
 static int daemon, live;
 static int dirty0, dirty1;            // rows of img changed since dim was last updated
 static double dim_shade;             // shade the dim buffer was computed for
-static double scale = 1, target = 1; // current and animated-to zoom
+static double scale = 1;             // zoom
 static double vx, vy;                // image point shown at window (0,0)
 static int mx, my;                   // cursor in client coords
 static int dragging, flashlight, closing; // closing = animating back to 1:1 before hiding
@@ -277,11 +278,11 @@ static void popup(HWND w) {
     shade = 0;
     dirty0 = 0;
     dirty1 = sh;
-    scale = target = 1;
+    scale = 1;
     vx = vy = 0;
     dragging = closing = 0;
     InvalidateRect(w, NULL, FALSE);
-    SetTimer(w, 1, 15, NULL);
+    if (live) SetTimer(w, 1, 15, NULL);
     ShowWindow(w, SW_SHOW);
     SetForegroundWindow(w);
 }
@@ -293,6 +294,37 @@ static void hide(HWND w) {
     ShowWindow(w, SW_HIDE);
     // Don't hold three screen-sized buffers while idle; fit_screen reallocates on popup.
     free_bufs();
+}
+
+// Step the flashlight fade and close animations by the real time since the last frame, so they run
+// as smooth as the monitor refreshes and at the same speed on any refresh rate. Returns 1 while moving.
+static int animate(HWND w) {
+    static LARGE_INTEGER last;
+    LARGE_INTEGER now, f;
+    double t, k;
+    int moving = 0;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&now);
+    t = (double)(now.QuadPart - last.QuadPart) / f.QuadPart / 0.0156; // in old 15.6 ms timer ticks
+    last = now;
+    if (t > 3) t = 1; // first frame after idle: one normal step, not a jump
+    if (fabs(flashlight - shade) > 1e-3) { // flashlight fade in/out
+        shade += (flashlight - shade) * (1 - pow(0.75, t));
+        if (fabs(flashlight - shade) <= 1e-3) shade = flashlight;
+        moving = 1;
+    }
+    if (closing) { // ease view back to 1:1, then hide
+        // Scale about the one screen point that is in the same place zoomed and at 1:1,
+        // so the view shrinks back into place instead of sliding: vx = c * (1 - 1/scale).
+        k = pow(0.7, t);
+        double s = 1 + (scale - 1) * k;
+        vx *= k * scale / s;
+        vy *= k * scale / s;
+        scale = s;
+        if (fabs(scale - 1) < 5e-3 && fabs(vx) < 1 && fabs(vy) < 1 && shade < 0.02) { hide(w); return 0; }
+        return 1;
+    }
+    return moving;
 }
 
 static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
@@ -311,9 +343,7 @@ static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
             if (radius < 10) radius = 10;
             if (radius > sw + sh) radius = sw + sh; // bigger covers the screen anyway; keeps (int)radius valid
         } else {
-            target *= f;
-            if (target < 0.1) target = 0.1;
-            if (target > 200) target = 200;
+            zoom_to(min(max(scale * f, 0.1), 200));
         }
         InvalidateRect(w, NULL, FALSE);
         return 0;
@@ -342,36 +372,17 @@ static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
             closing = 1;
             flashlight = dragging = 0;
             ReleaseCapture();
+            InvalidateRect(w, NULL, FALSE);
             return 0;
         }
         if (closing) return 0;
-        if (wp == '0' || wp == VK_NUMPAD0) { scale = target = 1; vx = vy = 0; }
+        if (wp == '0' || wp == VK_NUMPAD0) { scale = 1; vx = vy = 0; }
         if (wp == 'F') flashlight = !flashlight;
         InvalidateRect(w, NULL, FALSE);
         return 0;
-    case WM_TIMER:
-        if (live && dup_lost && ++retry % 30 == 0) open_dups();
+    case WM_TIMER: // live capture only
+        if (dup_lost && ++retry % 30 == 0) open_dups();
         if (grab(0)) InvalidateRect(w, NULL, FALSE);
-        if (fabs(flashlight - shade) > 1e-3) { // flashlight fade in/out
-            shade += (flashlight - shade) * 0.25;
-            if (fabs(flashlight - shade) <= 1e-3) shade = flashlight;
-            InvalidateRect(w, NULL, FALSE);
-        }
-        if (closing) { // ease view back to 1:1, then hide
-            // Scale about the one screen point that is in the same place zoomed and at 1:1,
-            // so the view shrinks back into place instead of sliding: vx = c * (1 - 1/scale).
-            double s = scale + (1 - scale) * 0.3;
-            vx *= 0.7 * scale / s;
-            vy *= 0.7 * scale / s;
-            scale = s;
-            if (fabs(scale - 1) < 5e-3 && fabs(vx) < 1 && fabs(vy) < 1 && shade < 0.02) hide(w);
-            InvalidateRect(w, NULL, FALSE);
-            return 0;
-        }
-        if (fabs(target - scale) > 1e-4 * target) { // smooth zoom animation
-            zoom_to(fabs(target - scale) < 1e-3 * target ? target : scale + (target - scale) * 0.3);
-            InvalidateRect(w, NULL, FALSE);
-        }
         return 0;
     case WM_ERASEBKGND:
         return 1;
@@ -398,6 +409,10 @@ static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
         }
         BitBlt(dc, 0, 0, sw, sh, hdcBack, 0, 0, SRCCOPY);
         EndPaint(w, &ps);
+        // Wait for the screen refresh, then step: one frame per refresh while anything moves.
+        // shortcut: if DwmFlush returns at once (rare, e.g. some remote sessions) animations spin a core until done.
+        DwmFlush();
+        if (animate(w)) InvalidateRect(w, NULL, FALSE);
         return 0;
     }
     case WM_DESTROY:
