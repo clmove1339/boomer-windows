@@ -1,7 +1,8 @@
-// boomer for Windows: zoom into the desktop, pixelated, updating live.
+// boomer for Windows: zoom into a screenshot of the desktop, pixelated.
 // Drag = pan, wheel = zoom, F = flashlight, Ctrl+wheel = flashlight size,
 // 0 = reset, Q/Esc = quit.
 // `boomer --daemon` stays in the background and pops up instantly on Win+Shift+Z.
+// `--live` keeps the image updating, but hides boomer from screen sharing.
 #define WIN32_LEAN_AND_MEAN
 #define COBJMACROS
 #include <windows.h>
@@ -14,7 +15,7 @@
 static int sw, sh, sx, sy;           // virtual screen size/origin
 static HDC hdcImg, hdcDim, hdcBack;  // screenshot, darkened screenshot, back buffer
 static DWORD *img, *dim;
-static int daemon;
+static int daemon, live;
 static int dirty0, dirty1;            // rows of img changed since dim was last updated
 static double dim_shade;             // shade the dim buffer was computed for
 static double scale = 1, target = 1; // current and animated-to zoom
@@ -258,6 +259,7 @@ static void popup(HWND w) {
     ReleaseDC(NULL, screen);
     open_dups();
     for (int t = 0; t < 10 && waiting(); t++) grab(25); // first real frame from every monitor
+    if (!live) close_dups();
     flashlight = 0;
     shade = 0;
     dirty0 = 0;
@@ -335,7 +337,7 @@ static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
         InvalidateRect(w, NULL, FALSE);
         return 0;
     case WM_TIMER:
-        if (dup_lost && ++retry % 30 == 0) open_dups();
+        if (live && dup_lost && ++retry % 30 == 0) open_dups();
         if (grab(0)) InvalidateRect(w, NULL, FALSE);
         if (fabs(flashlight - shade) > 1e-3) { // flashlight fade in/out
             shade += (flashlight - shade) * 0.25;
@@ -404,6 +406,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prevInst, LPSTR cmd, int show) {
 
     self_test();
     daemon = strstr(cmd, "--daemon") != NULL;
+    live = strstr(cmd, "--live") != NULL;
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2); // capture real pixels, not scaled
 
     wc.lpfnWndProc = wndproc;
@@ -413,7 +416,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prevInst, LPSTR cmd, int show) {
     RegisterClassW(&wc);
     w = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, L"boomer", L"boomer", WS_POPUP,
                         0, 0, 1, 1, NULL, NULL, inst, NULL);
-    SetWindowDisplayAffinity(w, WDA_EXCLUDEFROMCAPTURE); // live capture must not see our own window
+    // Live capture must not see our own window; this also hides boomer from screen sharing.
+    if (live) SetWindowDisplayAffinity(w, WDA_EXCLUDEFROMCAPTURE);
     if (daemon) {
         if (!RegisterHotKey(w, 1, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, 'Z')) {
             MessageBoxW(NULL, L"Win+Shift+Z is taken (boomer already running?)", L"boomer", MB_ICONERROR);

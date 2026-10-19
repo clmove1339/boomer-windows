@@ -16,7 +16,11 @@ build.bat
 ```bat
 boomer.exe            :: open once, Esc quits
 boomer.exe --daemon   :: stay in the background, pop up on Win+Shift+Z
+boomer.exe --live     :: keep the image updating while open (combines with --daemon)
 ```
+
+By default boomer zooms a screenshot taken when it opens, like the original, and shows up in screen sharing (Discord, OBS).
+With `--live` the image keeps updating, but boomer has to hide its own window from capture, so viewers of a screen share don't see the zoom.
 
 To start the daemon on login, put a shortcut to `boomer.exe --daemon` into `shell:startup`.
 
@@ -33,9 +37,9 @@ To start the daemon on login, put a shortcut to `boomer.exe --daemon` into `shel
 
 ## How it works
 
-- **Capture:** DXGI Desktop Duplication on every monitor, with a GDI fallback. The image stays live while open, and boomer's own window is excluded from capture.
+- **Capture:** DXGI Desktop Duplication on every monitor, with a GDI fallback. With `--live` the image stays live while open, and boomer's own window is excluded from capture.
 - **Pixelated zoom:** `StretchBlt` with `COLORONCOLOR` (nearest neighbour).
 - **Monitors:** The layout is re-read on every popup, so plugging monitors in needs no restart.
 - **Idle cost:** While hidden, the daemon uses no timer and frees its screen buffers. It keeps the D3D device so popup takes ~20–30 ms.
 
-Known limits: rotated monitors fall back to a static GDI capture. A monitor added while boomer is open shows up on the next popup.
+Known limits: rotated monitors fall back to a static GDI capture. A monitor added while boomer is open shows up on the next popup. While a screen share with cursor is running, Windows may draw the cursor into the screenshot, so it gets zoomed too.
