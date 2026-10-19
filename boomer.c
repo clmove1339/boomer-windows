@@ -65,6 +65,7 @@ static int get_device(IDXGIAdapter1 *a, ID3D11Device **dev, ID3D11DeviceContext 
 static HDC make_dib(int w, int h, DWORD **bits) {
     BITMAPINFO bi = {{sizeof(BITMAPINFOHEADER), w, -h, 1, 32, BI_RGB}};
     HDC dc = CreateCompatibleDC(NULL);
+    *bits = NULL;
     SelectObject(dc, CreateDIBSection(dc, &bi, DIB_RGB_COLORS, (void **)bits, NULL, 0));
     return dc;
 }
@@ -75,21 +76,30 @@ static void free_dib(HDC dc) {
     DeleteObject(b);
 }
 
+static void free_bufs(void) {
+    if (hdcImg) { free_dib(hdcImg); free_dib(hdcDim); free_dib(hdcBack); }
+    hdcImg = NULL;
+    sw = sh = 0;
+}
+
 // Follow the current monitor layout: resize buffers and window if it changed.
-static void fit_screen(HWND w) {
+// Returns 0 if the screen buffers could not be allocated.
+static int fit_screen(HWND w) {
     int cw = GetSystemMetrics(SM_CXVIRTUALSCREEN), ch = GetSystemMetrics(SM_CYVIRTUALSCREEN);
     DWORD *back;
     if (cw != sw || ch != sh) {
-        if (hdcImg) { free_dib(hdcImg); free_dib(hdcDim); free_dib(hdcBack); }
+        free_bufs();
         sw = cw; sh = ch;
         hdcImg = make_dib(sw, sh, &img);
         hdcDim = make_dib(sw, sh, &dim);
         hdcBack = make_dib(sw, sh, &back);
+        if (!img || !dim || !back) { free_bufs(); return 0; }
         SetStretchBltMode(hdcBack, COLORONCOLOR); // nearest neighbour = pixelated
     }
     sx = GetSystemMetrics(SM_XVIRTUALSCREEN);
     sy = GetSystemMetrics(SM_YVIRTUALSCREEN);
     SetWindowPos(w, HWND_TOPMOST, sx, sy, sw, sh, SWP_NOACTIVATE);
+    return 1;
 }
 
 static void close_dups(void) {
@@ -121,7 +131,9 @@ static void open_dups(void) {
                 if (od.AttachedToDesktop && od.Rotation <= DXGI_MODE_ROTATION_IDENTITY &&
                     SUCCEEDED(IDXGIOutput_QueryInterface(o, &IID_IDXGIOutput1, (void **)&o1))) {
                     Dup *d = &dups[ndups];
-                    if (SUCCEEDED(IDXGIOutput1_DuplicateOutput(o1, (IUnknown *)dev, &d->dup))) {
+                    HRESULT hr = IDXGIOutput1_DuplicateOutput(o1, (IUnknown *)dev, &d->dup);
+                    if (hr == E_ACCESSDENIED) dup_lost = 1; // secure desktop (lock screen, UAC): retry later
+                    if (SUCCEEDED(hr)) {
                         d->dev = dev; ID3D11Device_AddRef(dev);
                         d->ctx = ctx; ID3D11DeviceContext_AddRef(ctx);
                         d->stage = NULL;
@@ -235,7 +247,11 @@ static void zoom_to(double s) {
 
 static void popup(HWND w) {
     HDC screen;
-    fit_screen(w);
+    if (!fit_screen(w)) {
+        MessageBoxW(NULL, L"Not enough memory for the screen buffers", L"boomer", MB_ICONERROR);
+        if (!daemon) DestroyWindow(w);
+        return;
+    }
     // GDI first as a fallback for monitors DXGI can't duplicate, then DXGI on top.
     screen = GetDC(NULL);
     BitBlt(hdcImg, 0, 0, sw, sh, screen, sx, sy, SRCCOPY | CAPTUREBLT);
@@ -260,10 +276,8 @@ static void hide(HWND w) {
     if (!daemon) { DestroyWindow(w); return; }
     KillTimer(w, 1);
     ShowWindow(w, SW_HIDE);
-    // 4: don't hold three screen-sized buffers while idle; fit_screen reallocates on popup.
-    free_dib(hdcImg); free_dib(hdcDim); free_dib(hdcBack);
-    hdcImg = NULL;
-    sw = sh = 0;
+    // Don't hold three screen-sized buffers while idle; fit_screen reallocates on popup.
+    free_bufs();
 }
 
 static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
@@ -280,6 +294,7 @@ static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
         if (flashlight && (LOWORD(wp) & MK_CONTROL)) {
             radius *= f;
             if (radius < 10) radius = 10;
+            if (radius > sw + sh) radius = sw + sh; // bigger covers the screen anyway; keeps (int)radius valid
         } else {
             target *= f;
             if (target < 0.1) target = 0.1;
@@ -299,12 +314,14 @@ static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_MOUSEMOVE: {
         int x = (short)LOWORD(lp), y = (short)HIWORD(lp);
+        if (!(wp & MK_LBUTTON)) dragging = 0; // button released outside (Alt+Tab mid-drag)
         if (dragging) { vx -= (x - mx) / scale; vy -= (y - my) / scale; }
         mx = x; my = y;
         if (dragging || shade > 0) InvalidateRect(w, NULL, FALSE);
         return 0;
     }
     case WM_KEYDOWN:
+        if (lp & 0x40000000) return 0; // auto-repeat of a held key
         if (wp == VK_ESCAPE || wp == 'Q') { // first press animates out, a second one skips it
             if (closing) hide(w);
             closing = 1;
