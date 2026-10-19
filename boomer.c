@@ -345,9 +345,12 @@ static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
             InvalidateRect(w, NULL, FALSE);
         }
         if (closing) { // ease view back to 1:1, then hide
-            scale += (1 - scale) * 0.3;
-            vx *= 0.7;
-            vy *= 0.7;
+            // Scale about the one screen point that is in the same place zoomed and at 1:1,
+            // so the view shrinks back into place instead of sliding: vx = c * (1 - 1/scale).
+            double s = scale + (1 - scale) * 0.3;
+            vx *= 0.7 * scale / s;
+            vy *= 0.7 * scale / s;
+            scale = s;
             if (fabs(scale - 1) < 5e-3 && fabs(vx) < 1 && fabs(vy) < 1 && shade < 0.02) hide(w);
             InvalidateRect(w, NULL, FALSE);
             return 0;
