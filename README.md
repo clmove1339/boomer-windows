@@ -1,9 +1,9 @@
-![boomer for Windows](banner.png)
+![boomer for Windows](assets/banner.png)
 
 A Windows take on [tsoding/boomer](https://github.com/tsoding/boomer): zoom into your screen, pixelated, with a flashlight.
 It's one C file using Win32, GDI and DXGI, with no dependencies, and builds to a ~170 KB exe.
 
-![boomer zooming into its own source code: wheel zoom, drag, flashlight, Esc](demo.gif)
+![boomer zooming into its own source code: wheel zoom, drag, flashlight, Esc](assets/demo.gif)
 
 ## Build
 
@@ -12,6 +12,8 @@ Needs Visual Studio 2022 with the C++ workload:
 ```bat
 build.bat
 ```
+
+The exe lands in `build\boomer.exe`.
 
 ## Run
 
